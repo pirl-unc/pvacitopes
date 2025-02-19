@@ -3,44 +3,28 @@
 A tool to process TSV files of predicted mutant epitopes and rank them.
 
 Pipeline:
-  1. Reads an input TSV file.
-  2. Computes MHC threshold boolean columns (with clean names starting with "filter:")
-     for five metrics:
-         - MHCflurryEL Presentation MT Score (> threshold)
-         - NetMHCpanEL MT Percentile (< threshold)
-         - MHCflurryEL Presentation MT Percentile (< threshold)
-         - NetMHCpan MT IC50 Score (< threshold)
-         - NetMHCpan MT Percentile (< threshold)
-     For MHCflurry Presentation Score, an adaptive scheme (by default) is used so that
-     for the default range (0.5 to 0.95) and 4 thresholds you get values close to:
-         [0.50, 0.75, 0.90, 0.95]; if the number increases (e.g. to 5) then roughly
-         [0.50, 0.75, 0.85, 0.90, 0.95]. (For the other metrics, the default step type is “log2”.)
-  3. Sums these boolean columns into a per‐row "Sum_MHC_Score" and discards rows with a zero score.
-  4. Groups the remaining rows by mutation (using canonical columns)
-     and selects the best transcript based on:
-         - Highest Transcript Expression (within 10% of max)
-         - Preference for protein_coding
-         - Best (lowest) Transcript Support Level
-         - Highest Protein Position
-         - Lexicographic tie-breaker on Transcript.
-  5. Computes additional scores:
-         - "filter: frameshift": a numeric (0/1) flag for frameshift mutations.
-         - "RNA_Score": computed from Transcript Expression using a transformation chosen
-           by the parameter `rna_transform` ("linear", "sqrt", or "log2").
-         - "DNA_Score": defined as min(1, Tumor DNA VAF / median(Tumor DNA VAF)).
-         - "Bonus": applied if the mutation is a frameshift.
-         - Final "Ranking_Score" = Sum_MHC_Score * DNA_Score * RNA_Score * Bonus.
-  6. Outputs a full TSV (sorted descending by Ranking_Score) and a top‑n TSV.
-  7. Logs summary counts for HLA Allele and Gene Name among the top‑n.
-
-Usage:
-    python rank_epitopes.py --input-file INPUT.tsv [other options]
-
-New options allow:
-  - Overriding the names of key columns via CLI arguments.
-  - Logging the merged CLI arguments for reproducibility.
-  - Saving the merged CLI args to a JSON/YAML file.
-  - Loading a set of defaults from a JSON/YAML file, which can be overridden by CLI args.
+  1) Load CLI arguments (possibly merged with defaults from a JSON/YAML file).
+  2) Read a TSV file of predicted mutant epitopes.
+  3) Apply basic filters:
+       - Normal VAF <= normal_vaf_max
+       - Tumor DNA Depth >= tumor_dna_depth_min
+       - Normal Depth >= normal_depth_min
+       - Tumor DNA VAF >= tumor_dna_vaf_min
+  4) Compute "Mutant_RNA_Expression" = (Tumor RNA VAF × Gene Expression).
+  5) For each mutation, select up to max_peptides_per_mutation transcripts:
+       - Filter to transcripts with Transcript Expression ≥ 90% of the group's maximum.
+       - If any candidate is protein_coding, restrict to those.
+       - Use TSL (transcript support level) for tie-breaking (with "NA" treated as 6).
+       - Then, use Transcript Length (descending) as a tie-breaker, followed by Transcript (alphabetically).
+  6) Compute boolean columns for MHC thresholds and Sum_MHC_Score.
+  7) Compute additional scores (DNA_Score, RNA_Score using Mutant_RNA_Expression, frameshift bonus)
+       and the final Ranking_Score.
+  8) Construct a new "Mutation Description" column as "Gene Name" + "_" + "Mutation".
+  9) Collapse duplicate peptides in two steps:
+       a) For each unique peptide (identified by the column specified by col_mt_epitope_seq),
+          group by "Mutation Description" and select the mutation with the highest Mutant_RNA_Expression.
+       b) Then, within that mutation, select the row (i.e. the HLA allele) with the highest Sum_MHC_Score.
+ 10) Finally, re‑sort the collapsed results by Ranking_Score (descending) before writing outputs.
 """
 
 import sys
@@ -84,7 +68,6 @@ def load_defaults_from_file(file_path: str) -> dict:
                     logger.error("YAML file provided but PyYAML is not installed.")
                     sys.exit(1)
             else:
-                # Default to JSON
                 return json.load(f)
     except Exception as e:
         logger.error("Error loading defaults from {}: {}", file_path, e)
@@ -113,109 +96,23 @@ def save_args_to_file(
 def get_tsl_value(tsl: str) -> float:
     """
     Convert a Transcript Support Level (TSL) value to a numeric value.
-
-    Args:
-        tsl (str): The TSL value, e.g. "TSL1" or "1".
-
-    Returns:
-        float: A numeric value.
+    Treat "NA" (case-insensitive) as 6.
     """
+    tsl_str = str(tsl).strip().upper()
+    if tsl_str == "NA":
+        return 6.0
     try:
         return float(tsl)
     except ValueError:
-        m = re.search(r"\d+", str(tsl))
+        m = re.search(r"\d+", tsl_str)
         if m:
             return float(m.group(0))
     return np.inf
 
 
-def select_best_transcript(group: pd.DataFrame, log_ctx: logger) -> pd.Series:
-    """
-    Select the best transcript from a group (all rows for a given mutation)
-    based on:
-      1. Transcript Expression (within 10% of max)
-      2. Preference for protein_coding biotype
-      3. Lowest Transcript Support Level
-      4. Highest Protein Position
-      5. Lexicographic order on Transcript.
-
-    Args:
-        group (pd.DataFrame): Group of transcripts for one mutation.
-        log_ctx (logger): Logger for decision messages.
-
-    Returns:
-        pd.Series: The selected transcript row.
-    """
-    group = group.copy()
-    decision_notes = []
-    # Convert to numeric.
-    group["Transcript Expression"] = pd.to_numeric(
-        group["Transcript Expression"], errors="coerce"
-    )
-    group["Protein Position"] = pd.to_numeric(
-        group["Protein Position"], errors="coerce"
-    )
-
-    # 1. Filter: keep transcripts within 10% of max expression.
-    max_expr = group["Transcript Expression"].max()
-    expr_threshold = 0.9 * max_expr
-    candidates = group[group["Transcript Expression"] >= expr_threshold]
-    decision_notes.append(
-        f"Max Expression: {max_expr:.3f} (threshold: {expr_threshold:.3f}), candidates: {len(candidates)}"
-    )
-
-    # 2. Prefer protein_coding.
-    if (candidates["Biotype"] == "protein_coding").any():
-        candidates_pc = candidates[candidates["Biotype"] == "protein_coding"]
-        decision_notes.append(f"Filtered protein_coding: {len(candidates_pc)}")
-        candidates = candidates_pc
-
-    # 3. Prefer lowest TSL.
-    candidates["TSL_numeric"] = candidates["Transcript Support Level"].apply(
-        get_tsl_value
-    )
-    best_tsl = candidates["TSL_numeric"].min()
-    candidates = candidates[candidates["TSL_numeric"] == best_tsl]
-    decision_notes.append(f"Best TSL: {best_tsl}, candidates: {len(candidates)}")
-
-    # 4. Prefer highest protein position.
-    best_protein_pos = candidates["Protein Position"].max()
-    candidates = candidates[candidates["Protein Position"] == best_protein_pos]
-    decision_notes.append(
-        f"Highest Protein Position: {best_protein_pos}, candidates: {len(candidates)}"
-    )
-
-    # 5. Lexicographic order on Transcript.
-    candidates = candidates.sort_values("Transcript")
-    chosen = candidates.iloc[0]
-    decision_notes.append(f"Chosen transcript: {chosen['Transcript']}")
-
-    mutation_id = group.iloc[0][
-        ["Chromosome", "Start", "Stop", "Reference", "Variant", "Gene Name"]
-    ].to_dict()
-    log_ctx.info("Mutation {}: {}", mutation_id, " | ".join(decision_notes))
-    return chosen
-
-
 def adaptive_thresholds(min_val: float, max_val: float, num: int) -> np.ndarray:
     """
     Generate adaptive thresholds for MHCflurry presentation score.
-
-    The first value is fixed to min_val and the last to max_val.
-    For num>=3, intermediate thresholds are chosen so that for the default
-    range (0.5 to 0.95) you get values close to:
-       n=4: [0.50, 0.75, 0.90, 0.95]
-       n=5: [0.50, 0.75, 0.85, 0.90, 0.95]
-    For other ranges, intermediate thresholds are linearly interpolated using
-    normalized anchors 0.5556 and 0.8889.
-
-    Args:
-        min_val (float): Minimum threshold.
-        max_val (float): Maximum threshold.
-        num (int): Total number of thresholds.
-
-    Returns:
-        np.ndarray: Array of thresholds.
     """
     if num == 1:
         return np.array([min_val])
@@ -228,6 +125,155 @@ def adaptive_thresholds(min_val: float, max_val: float, num: int) -> np.ndarray:
         + [max_val]
     )
     return np.array(thresholds)
+
+
+def generate_thresholds(
+    min_val: float, max_val: float, num: int, step_type: str, reverse: bool = False
+) -> np.ndarray:
+    """
+    Generate an array of thresholds based on the given parameters.
+    """
+    stype = step_type.lower()
+    if stype == "adaptive":
+        vals = adaptive_thresholds(min_val, max_val, num)
+    elif stype == "linear":
+        vals = (
+            np.linspace(max_val, min_val, num)
+            if reverse
+            else np.linspace(min_val, max_val, num)
+        )
+    elif stype == "log2":
+        vals = (
+            np.geomspace(max_val, min_val, num=num)
+            if reverse
+            else np.geomspace(min_val, max_val, num=num)
+        )
+    else:
+        logger.error("Invalid step type: {}", step_type)
+        sys.exit(1)
+    return vals
+
+
+def select_transcripts(
+    group: pd.DataFrame, max_peptides: int, log_ctx: logger
+) -> pd.DataFrame:
+    """
+    Select up to max_peptides transcripts for a given mutation group.
+
+    Selection steps:
+      1. Convert Transcript Expression and Transcript Length to numeric.
+      2. Keep transcripts with Transcript Expression within 90% of the group's maximum.
+      3. If any candidate is protein_coding, restrict to those.
+      4. Compute a numeric TSL (treating "NA" as 6).
+      5. Sort candidates by:
+           - Sum_MHC_Score (descending),
+           - TSL_numeric (ascending),
+           - Transcript Length (descending),
+           - Transcript (ascending).
+      6. Return the top max_peptides rows.
+    """
+    group = group.copy()
+    group["Transcript Expression"] = pd.to_numeric(
+        group["Transcript Expression"], errors="coerce"
+    )
+    group["Transcript Length"] = pd.to_numeric(
+        group["Transcript Length"], errors="coerce"
+    )
+    max_expr = group["Transcript Expression"].max()
+    expr_threshold = 0.9 * max_expr
+    candidates = group[group["Transcript Expression"] >= expr_threshold]
+
+    if (candidates["Biotype"] == "protein_coding").any():
+        candidates = candidates[candidates["Biotype"] == "protein_coding"]
+
+    candidates["TSL_numeric"] = candidates["Transcript Support Level"].apply(
+        get_tsl_value
+    )
+    # Sort by Sum_MHC_Score descending, TSL_numeric ascending, Transcript Length descending, and then Transcript ascending.
+    candidates = candidates.sort_values(
+        by=["Sum_MHC_Score", "TSL_numeric", "Transcript Length", "Transcript"],
+        ascending=[False, True, False, True],
+    )
+
+    mutation_id = group.iloc[0][
+        ["Chromosome", "Start", "Stop", "Reference", "Variant", "Gene Name"]
+    ].to_dict()
+    log_ctx.info(
+        "Mutation {}: selected {} transcripts out of {} candidates after filtering",
+        mutation_id,
+        min(len(candidates), max_peptides),
+        len(candidates),
+    )
+    return candidates.head(max_peptides)
+
+
+def merge_args(cli_args: dict, load_defaults=None):
+    """
+    Merge CLI arguments with built-in defaults and optionally loaded defaults.
+    Priority: built-in defaults < loaded defaults < CLI args.
+    """
+    builtin_defaults = {
+        k: v.default
+        for k, v in inspect.signature(main).parameters.items()
+        if v.default is not inspect.Parameter.empty
+    }
+    loaded_defaults = (
+        load_defaults_from_file(load_defaults) if load_defaults is not None else {}
+    )
+    merged = {}
+    for key in cli_args:
+        if key in builtin_defaults:
+            merged[key] = (
+                loaded_defaults.get(key, cli_args[key])
+                if cli_args[key] == builtin_defaults[key]
+                else cli_args[key]
+            )
+        else:
+            merged[key] = cli_args[key]
+    logger.info("Merged CLI arguments:")
+    for k, v in merged.items():
+        logger.info("  {}: {}", k, v)
+    return merged
+
+
+def rename_input_columns(merged_args: dict, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename user-provided column names to canonical names.
+    """
+    col_mapping = {
+        merged_args["col_chromosome"]: "Chromosome",
+        merged_args["col_start"]: "Start",
+        merged_args["col_stop"]: "Stop",
+        merged_args["col_reference"]: "Reference",
+        merged_args["col_variant"]: "Variant",
+        merged_args["col_transcript"]: "Transcript",
+        merged_args["col_transcript_support"]: "Transcript Support Level",
+        merged_args["col_transcript_expression"]: "Transcript Expression",
+        merged_args["col_biotype"]: "Biotype",
+        merged_args[
+            "col_protein_position"
+        ]: "Protein Position",  # Still available if needed elsewhere.
+        merged_args["col_transcript_length"]: "Transcript Length",
+        merged_args["col_gene_name"]: "Gene Name",
+        merged_args["col_mutation"]: "Mutation",
+        merged_args["col_mhcflurry_presentation"]: "MHCflurryEL Presentation MT Score",
+        merged_args["col_netmhcpan_el"]: "NetMHCpanEL MT Percentile",
+        merged_args[
+            "col_mhcflurry_presentation_percentile"
+        ]: "MHCflurryEL Presentation MT Percentile",
+        merged_args["col_netmhcpan_ba"]: "NetMHCpan MT IC50 Score",
+        merged_args["col_netmhcpan_percentile"]: "NetMHCpan MT Percentile",
+        merged_args["col_tumor_dna_vaf"]: "Tumor DNA VAF",
+        merged_args["col_hla_allele"]: "HLA Allele",
+        # New columns:
+        merged_args["col_normal_vaf"]: "Normal VAF",
+        merged_args["col_tumor_dna_depth"]: "Tumor DNA Depth",
+        merged_args["col_normal_depth"]: "Normal Depth",
+        merged_args["col_tumor_rna_vaf"]: "Tumor RNA VAF",
+        merged_args["col_gene_expression"]: "Gene Expression",
+        merged_args["col_mt_epitope_seq"]: "MT Epitope Seq",
+    }
+    return df.rename(columns=col_mapping, inplace=False)
 
 
 def main(
@@ -260,6 +306,13 @@ def main(
     max_threshold_netmhcpan_percentile: float = 2,
     num_threshold_netmhcpan_percentile: int = 4,
     step_type_netmhcpan_pct: str = "log2",
+    # New filters:
+    normal_vaf_max: float = 0.01,
+    tumor_dna_depth_min: int = 30,
+    normal_depth_min: int = 30,
+    tumor_dna_vaf_min: float = 0.025,
+    # New argument: allow up to this many peptides per mutation.
+    max_peptides_per_mutation: int = 3,
     # Column name options:
     col_chromosome: str = "Chromosome",
     col_start: str = "Start",
@@ -271,6 +324,7 @@ def main(
     col_transcript_expression: str = "Transcript Expression",
     col_biotype: str = "Biotype",
     col_protein_position: str = "Protein Position",
+    col_transcript_length: str = "Transcript Length",
     col_gene_name: str = "Gene Name",
     col_mutation: str = "Mutation",
     col_mhcflurry_presentation: str = "MHCflurryEL Presentation MT Score",
@@ -280,6 +334,13 @@ def main(
     col_netmhcpan_percentile: str = "NetMHCpan MT Percentile",
     col_tumor_dna_vaf: str = "Tumor DNA VAF",
     col_hla_allele: str = "HLA Allele",
+    col_normal_vaf: str = "Normal VAF",
+    col_tumor_dna_depth: str = "Tumor DNA Depth",
+    col_normal_depth: str = "Normal Depth",
+    col_tumor_rna_vaf: str = "Tumor RNA VAF",
+    col_gene_expression: str = "Gene Expression",
+    # New peptide column parameter:
+    col_mt_epitope_seq: str = "MT Epitope Seq",
     # Defaults file options:
     load_defaults: str = None,
     save_args: str = None,
@@ -287,48 +348,16 @@ def main(
 ) -> None:
     """
     Process the mutant epitope TSV file and output ranked epitopes.
-
-    New options allow overriding column names as well as loading/saving default CLI args.
     """
-    # --- Implicitly build built-in defaults from main's signature ---
-    builtin_defaults = {
-        k: v.default
-        for k, v in inspect.signature(main).parameters.items()
-        if v.default is not inspect.Parameter.empty
-    }
-    # Build a dictionary of CLI args from the parameters of main.
     cli_args = {k: locals()[k] for k in inspect.signature(main).parameters.keys()}
-
-    # If a defaults file is provided, load it.
-    if load_defaults is not None:
-        loaded_defaults = load_defaults_from_file(load_defaults)
-    else:
-        loaded_defaults = {}
-
-    # Merge: built‑in defaults < loaded defaults < CLI args.
-    merged = {}
-    for key in cli_args:
-        if key in builtin_defaults:
-            # If the CLI arg equals the built‐in default and a loaded default exists, use that.
-            if cli_args[key] == builtin_defaults[key] and key in loaded_defaults:
-                merged[key] = loaded_defaults[key]
-            else:
-                merged[key] = cli_args[key]
-        else:
-            # For required arguments (e.g. input_file) not in builtin_defaults.
-            merged[key] = cli_args[key]
-
-    # Log and optionally save the merged CLI arguments.
-    logger.info("Merged CLI arguments:")
-    for k, v in merged.items():
-        logger.info("  {}: {}", k, v)
+    merged = merge_args(cli_args=cli_args, load_defaults=load_defaults)
 
     if merged.get("save_args") is not None:
         save_args_to_file(
             merged, merged["save_args"], merged.get("save_args_format", "json")
         )
 
-    # --- Use merged values in the rest of the code ---
+    # --- Use merged values ---
     input_file = merged["input_file"]
     all_output = merged["all_output"]
     top_output = merged["top_output"]
@@ -336,6 +365,12 @@ def main(
     bonus_multiplier = merged["bonus_multiplier"]
     log_file = merged["log_file"]
     rna_transform = merged["rna_transform"]
+    normal_vaf_max = merged["normal_vaf_max"]
+    tumor_dna_depth_min = merged["tumor_dna_depth_min"]
+    normal_depth_min = merged["normal_depth_min"]
+    tumor_dna_vaf_min = merged["tumor_dna_vaf_min"]
+    max_peptides_per_mutation = merged["max_peptides_per_mutation"]
+
     min_threshold_mhcflurry_presentation_score = merged[
         "min_threshold_mhcflurry_presentation_score"
     ]
@@ -375,29 +410,6 @@ def main(
     num_threshold_netmhcpan_percentile = merged["num_threshold_netmhcpan_percentile"]
     step_type_netmhcpan_pct = merged["step_type_netmhcpan_pct"]
 
-    # Column names (original names in input file):
-    col_chromosome = merged["col_chromosome"]
-    col_start = merged["col_start"]
-    col_stop = merged["col_stop"]
-    col_reference = merged["col_reference"]
-    col_variant = merged["col_variant"]
-    col_transcript = merged["col_transcript"]
-    col_transcript_support = merged["col_transcript_support"]
-    col_transcript_expression = merged["col_transcript_expression"]
-    col_biotype = merged["col_biotype"]
-    col_protein_position = merged["col_protein_position"]
-    col_gene_name = merged["col_gene_name"]
-    col_mutation = merged["col_mutation"]
-    col_mhcflurry_presentation = merged["col_mhcflurry_presentation"]
-    col_netmhcpan_el = merged["col_netmhcpan_el"]
-    col_mhcflurry_presentation_percentile = merged[
-        "col_mhcflurry_presentation_percentile"
-    ]
-    col_netmhcpan_ba = merged["col_netmhcpan_ba"]
-    col_netmhcpan_percentile = merged["col_netmhcpan_percentile"]
-    col_tumor_dna_vaf = merged["col_tumor_dna_vaf"]
-    col_hla_allele = merged["col_hla_allele"]
-
     # Add log file handler.
     logger.add(
         log_file,
@@ -414,142 +426,127 @@ def main(
         logger.error("Error reading {}: {}", input_file, e)
         sys.exit(1)
 
-    # --- Rename input columns to canonical names ---
-    col_mapping = {
-        col_chromosome: "Chromosome",
-        col_start: "Start",
-        col_stop: "Stop",
-        col_reference: "Reference",
-        col_variant: "Variant",
-        col_transcript: "Transcript",
-        col_transcript_support: "Transcript Support Level",
-        col_transcript_expression: "Transcript Expression",
-        col_biotype: "Biotype",
-        col_protein_position: "Protein Position",
-        col_gene_name: "Gene Name",
-        col_mutation: "Mutation",
-        col_mhcflurry_presentation: "MHCflurryEL Presentation MT Score",
-        col_netmhcpan_el: "NetMHCpanEL MT Percentile",
-        col_mhcflurry_presentation_percentile: "MHCflurryEL Presentation MT Percentile",
-        col_netmhcpan_ba: "NetMHCpan MT IC50 Score",
-        col_netmhcpan_percentile: "NetMHCpan MT Percentile",
-        col_tumor_dna_vaf: "Tumor DNA VAF",
-        col_hla_allele: "HLA Allele",
-    }
-    df.rename(columns=col_mapping, inplace=True)
+    # --- Rename input columns ---
+    df = rename_input_columns(merged, df)
+
+    # --- Construct "Mutation Description" ---
+    if "Mutation Description" not in df.columns:
+        df["Mutation Description"] = (
+            df["Gene Name"].astype(str) + "_" + df["Mutation"].astype(str)
+        )
 
     # Check required columns.
-    required_columns = list(col_mapping.values())
+    required_columns = [
+        "Chromosome",
+        "Start",
+        "Stop",
+        "Reference",
+        "Variant",
+        "Transcript",
+        "Transcript Support Level",
+        "Transcript Expression",
+        "Transcript Length",
+        "Biotype",
+        "Protein Position",
+        "Gene Name",
+        "Mutation",
+        "Mutation Description",
+        "MHCflurryEL Presentation MT Score",
+        "NetMHCpanEL MT Percentile",
+        "MHCflurryEL Presentation MT Percentile",
+        "NetMHCpan MT IC50 Score",
+        "NetMHCpan MT Percentile",
+        "Tumor DNA VAF",
+        "HLA Allele",
+        "Normal VAF",
+        "Tumor DNA Depth",
+        "Normal Depth",
+        "Tumor RNA VAF",
+        "Gene Expression",
+        "MT Epitope Seq",
+    ]
     missing = [col for col in required_columns if col not in df.columns]
     if missing:
         logger.error("Missing required columns: {}", missing)
         sys.exit(1)
 
-    # === Compute MHC boolean columns on the full DataFrame ===
-    # MHCflurry Presentation Score:
-    stype = step_type_mhcflurry_pres.lower()
-    if stype == "adaptive":
-        thr_mhcflurry_pres = adaptive_thresholds(
-            min_threshold_mhcflurry_presentation_score,
-            max_threshold_mhcflurry_presentation_score,
-            num_threshold_mhcflurry_presentation_score,
-        )
-    elif stype == "linear":
-        thr_mhcflurry_pres = np.linspace(
-            min_threshold_mhcflurry_presentation_score,
-            max_threshold_mhcflurry_presentation_score,
-            num_threshold_mhcflurry_presentation_score,
-        )
-    elif stype == "log2":
-        thr_mhcflurry_pres = np.geomspace(
-            max_threshold_mhcflurry_presentation_score,
-            min_threshold_mhcflurry_presentation_score,
-            num=num_threshold_mhcflurry_presentation_score,
-        )
-    else:
-        logger.error(
-            "Invalid step type for mhcflurry presentation score: {}",
-            step_type_mhcflurry_pres,
-        )
-        sys.exit(1)
+    # --- Apply new filters ---
+    df_before = len(df)
+    df = df[df["Normal VAF"] <= normal_vaf_max]
+    logger.info(
+        "Filtered by Normal VAF <= {}: {} -> {} rows",
+        normal_vaf_max,
+        df_before,
+        len(df),
+    )
 
-    # NetMHCpanEL Percentile:
-    if step_type_netmhcpan_el.lower() == "linear":
-        thr_netmhcpan_el = np.linspace(
-            max_threshold_netmhcpan_el_percentile,
-            min_threshold_netmhcpan_el_percentile,
-            num_threshold_netmhcpan_el_percentile,
-        )
-    elif step_type_netmhcpan_el.lower() == "log2":
-        thr_netmhcpan_el = np.geomspace(
-            max_threshold_netmhcpan_el_percentile,
-            min_threshold_netmhcpan_el_percentile,
-            num=num_threshold_netmhcpan_el_percentile,
-        )
-    else:
-        logger.error(
-            "Invalid step type for netmhcpanel el percentile: {}",
-            step_type_netmhcpan_el,
-        )
-        sys.exit(1)
+    df_before = len(df)
+    df = df[df["Tumor DNA Depth"] >= tumor_dna_depth_min]
+    logger.info(
+        "Filtered by Tumor DNA Depth >= {}: {} -> {} rows",
+        tumor_dna_depth_min,
+        df_before,
+        len(df),
+    )
 
-    # MHCflurry Presentation Percentile:
-    if step_type_mhcflurry_pres_pct.lower() == "linear":
-        thr_mhcflurry_pres_pct = np.linspace(
-            max_threshold_mhcflurry_presentation_percentile,
-            min_threshold_mhcflurry_presentation_percentile,
-            num_threshold_mhcflurry_presentation_percentile,
-        )
-    elif step_type_mhcflurry_pres_pct.lower() == "log2":
-        thr_mhcflurry_pres_pct = np.geomspace(
-            max_threshold_mhcflurry_presentation_percentile,
-            min_threshold_mhcflurry_presentation_percentile,
-            num=num_threshold_mhcflurry_presentation_percentile,
-        )
-    else:
-        logger.error(
-            "Invalid step type for mhcflurry presentation percentile: {}",
-            step_type_mhcflurry_pres_pct,
-        )
-        sys.exit(1)
+    df_before = len(df)
+    df = df[df["Normal Depth"] >= normal_depth_min]
+    logger.info(
+        "Filtered by Normal Depth >= {}: {} -> {} rows",
+        normal_depth_min,
+        df_before,
+        len(df),
+    )
 
-    # NetMHCpan BA Score:
-    if step_type_netmhcpan_ba.lower() == "linear":
-        thr_netmhcpan_ba = np.linspace(
-            max_threshold_netmhcpan_ba,
-            min_threshold_netmhcpan_ba,
-            num_threshold_netmhcpan_ba,
-        )
-    elif step_type_netmhcpan_ba.lower() == "log2":
-        thr_netmhcpan_ba = np.geomspace(
-            max_threshold_netmhcpan_ba,
-            min_threshold_netmhcpan_ba,
-            num=num_threshold_netmhcpan_ba,
-        )
-    else:
-        logger.error("Invalid step type for netmhcpan BA: {}", step_type_netmhcpan_ba)
-        sys.exit(1)
+    df_before = len(df)
+    df = df[df["Tumor DNA VAF"] >= tumor_dna_vaf_min]
+    logger.info(
+        "Filtered by Tumor DNA VAF >= {}: {} -> {} rows",
+        tumor_dna_vaf_min,
+        df_before,
+        len(df),
+    )
 
-    # NetMHCpan Percentile:
-    if step_type_netmhcpan_pct.lower() == "linear":
-        thr_netmhcpan_pct = np.linspace(
-            max_threshold_netmhcpan_percentile,
-            min_threshold_netmhcpan_percentile,
-            num_threshold_netmhcpan_percentile,
-        )
-    elif step_type_netmhcpan_pct.lower() == "log2":
-        thr_netmhcpan_pct = np.geomspace(
-            max_threshold_netmhcpan_percentile,
-            min_threshold_netmhcpan_percentile,
-            num=num_threshold_netmhcpan_percentile,
-        )
-    else:
-        logger.error(
-            "Invalid step type for netmhcpan percentile: {}", step_type_netmhcpan_pct
-        )
-        sys.exit(1)
+    # --- Compute Mutant_RNA_Expression ---
+    df["Mutant_RNA_Expression"] = df["Tumor RNA VAF"] * df["Gene Expression"]
 
-    # Round thresholds to 2 decimals.
+    # === Compute MHC boolean columns ===
+    thr_mhcflurry_pres = generate_thresholds(
+        min_threshold_mhcflurry_presentation_score,
+        max_threshold_mhcflurry_presentation_score,
+        num_threshold_mhcflurry_presentation_score,
+        step_type_mhcflurry_pres,
+        reverse=(step_type_mhcflurry_pres.lower() == "log2"),
+    )
+    thr_netmhcpan_el = generate_thresholds(
+        min_threshold_netmhcpan_el_percentile,
+        max_threshold_netmhcpan_el_percentile,
+        num_threshold_netmhcpan_el_percentile,
+        step_type_netmhcpan_el,
+        reverse=True,
+    )
+    thr_mhcflurry_pres_pct = generate_thresholds(
+        min_threshold_mhcflurry_presentation_percentile,
+        max_threshold_mhcflurry_presentation_percentile,
+        num_threshold_mhcflurry_presentation_percentile,
+        step_type_mhcflurry_pres_pct,
+        reverse=True,
+    )
+    thr_netmhcpan_ba = generate_thresholds(
+        min_threshold_netmhcpan_ba,
+        max_threshold_netmhcpan_ba,
+        num_threshold_netmhcpan_ba,
+        step_type_netmhcpan_ba,
+        reverse=True,
+    )
+    thr_netmhcpan_pct = generate_thresholds(
+        min_threshold_netmhcpan_percentile,
+        max_threshold_netmhcpan_percentile,
+        num_threshold_netmhcpan_percentile,
+        step_type_netmhcpan_pct,
+        reverse=True,
+    )
+
     thr_mhcflurry_pres = np.round(thr_mhcflurry_pres, 2)
     thr_netmhcpan_el = np.round(thr_netmhcpan_el, 2)
     thr_mhcflurry_pres_pct = np.round(thr_mhcflurry_pres_pct, 2)
@@ -557,16 +554,12 @@ def main(
     thr_netmhcpan_pct = np.round(thr_netmhcpan_pct, 2)
 
     logger.info("Generated thresholds:")
-    logger.info("filter: mhcflurry presentation > thresholds: {}", thr_mhcflurry_pres)
-    logger.info("filter: netmhcpan el percentile < thresholds: {}", thr_netmhcpan_el)
-    logger.info(
-        "filter: mhcflurry presentation percentile < thresholds: {}",
-        thr_mhcflurry_pres_pct,
-    )
-    logger.info("filter: netmhcpan BA < thresholds: {}", thr_netmhcpan_ba)
-    logger.info("filter: netmhcpan percentile < thresholds: {}", thr_netmhcpan_pct)
+    logger.info("  MHCflurry presentation > {}", thr_mhcflurry_pres)
+    logger.info("  NetMHCpan EL percentile < {}", thr_netmhcpan_el)
+    logger.info("  MHCflurry presentation percentile < {}", thr_mhcflurry_pres_pct)
+    logger.info("  NetMHCpan BA < {}", thr_netmhcpan_ba)
+    logger.info("  NetMHCpan percentile < {}", thr_netmhcpan_pct)
 
-    # Create boolean columns with clean names.
     bool_cols = []
     for thr in thr_mhcflurry_pres:
         colname = f"filter: mhcflurry presentation > {thr:.2f}"
@@ -589,109 +582,133 @@ def main(
         df[colname] = (df["NetMHCpan MT Percentile"] < thr).astype(int)
         bool_cols.append(colname)
 
-    # Compute Sum_MHC_Score for each row.
     df["Sum_MHC_Score"] = df[bool_cols].sum(axis=1)
     logger.info("Computed Sum_MHC_Score for all rows.")
 
-    # Filter out rows with Sum_MHC_Score == 0.
+    df_before = len(df)
     df = df[df["Sum_MHC_Score"] > 0]
-    logger.info("Filtered to {} rows with Sum_MHC_Score > 0.", len(df))
+    logger.info(
+        "Filtered to rows with Sum_MHC_Score > 0: {} -> {} rows", df_before, len(df)
+    )
 
-    # === Group by mutation and select best transcript per mutation ===
+    # === Group by mutation and select transcripts per mutation ===
     mutation_cols = ["Chromosome", "Start", "Stop", "Reference", "Variant", "Gene Name"]
     groups = df.groupby(mutation_cols, as_index=False)
     selected = []
-    for name, group in groups:
+    for name, group_df in groups:
         try:
-            chosen = select_best_transcript(group, logger)
-            selected.append(chosen)
+            selected_group = select_transcripts(
+                group_df, max_peptides_per_mutation, logger
+            )
+            selected.append(selected_group)
         except Exception as ex:
-            logger.error("Error selecting transcript for mutation {}: {}", name, ex)
+            logger.error("Error selecting transcripts for mutation {}: {}", name, ex)
     if not selected:
-        logger.error("No transcripts selected after filtering; exiting.")
+        logger.error("No transcripts selected after grouping; exiting.")
         sys.exit(1)
-    df_best = pd.DataFrame(selected)
-    logger.info("Selected best transcript for {} mutations.", len(df_best))
+    df_selected = pd.concat(selected, ignore_index=True)
+    logger.info(
+        "Selected transcripts from {} mutations.",
+        df_selected[mutation_cols].drop_duplicates().shape[0],
+    )
 
-    # === Compute additional scores ===
-    # Create a numeric frameshift flag with "filter:" prefix.
-    df_best["filter: frameshift"] = (
-        df_best["Mutation"]
+    # === Compute additional scores on df_selected ===
+    df_selected["filter: frameshift"] = (
+        df_selected["Mutation"]
         .str.contains("fs|frameshift", flags=re.IGNORECASE, na=False)
         .astype(int)
     )
-
-    # Compute DNA_Score = min(1, Tumor DNA VAF / median(Tumor DNA VAF)).
-    median_dna_vaf = df_best["Tumor DNA VAF"].median()
+    median_dna_vaf = df_selected["Tumor DNA VAF"].median()
     if median_dna_vaf == 0:
         logger.warning(
             "Median Tumor DNA VAF is 0; setting DNA_Score to 1 for all entries."
         )
-        df_best["DNA_Score"] = 1
+        df_selected["DNA_Score"] = 1
     else:
-        df_best["DNA_Score"] = (df_best["Tumor DNA VAF"] / median_dna_vaf).clip(upper=1)
-
-    # Compute RNA_Score from Transcript Expression based on transformation.
+        df_selected["DNA_Score"] = (df_selected["Tumor DNA VAF"] / median_dna_vaf).clip(
+            upper=1
+        )
     try:
-        expr = df_best["Transcript Expression"].astype(float)
+        expr = df_selected["Mutant_RNA_Expression"].astype(float)
     except Exception as e:
-        logger.error("Error converting Transcript Expression to float: {}", e)
+        logger.error("Error converting Mutant_RNA_Expression to float: {}", e)
         sys.exit(1)
     rna_trans = rna_transform.lower()
     if rna_trans == "linear":
-        df_best["RNA_Score"] = expr
+        df_selected["RNA_Score"] = expr
     elif rna_trans == "sqrt":
-        df_best["RNA_Score"] = np.sqrt(expr)
+        df_selected["RNA_Score"] = np.sqrt(expr)
     elif rna_trans == "log2":
-        df_best["RNA_Score"] = np.log2(expr + 1)
+        df_selected["RNA_Score"] = np.log2(expr + 1)
     else:
         logger.error("Invalid RNA transform: {}", rna_transform)
         sys.exit(1)
-
-    # Apply bonus for frameshift mutations.
-    df_best["Bonus"] = np.where(df_best["filter: frameshift"] == 1, bonus_multiplier, 1)
-
-    # Compute final Ranking_Score using RNA_Score.
-    df_best["Ranking_Score"] = (
-        df_best["Sum_MHC_Score"]
-        * df_best["DNA_Score"]
-        * df_best["RNA_Score"]
-        * df_best["Bonus"]
+    df_selected["Bonus"] = np.where(
+        df_selected["filter: frameshift"] == 1, bonus_multiplier, 1
+    )
+    df_selected["Ranking_Score"] = (
+        df_selected["Sum_MHC_Score"]
+        * df_selected["DNA_Score"]
+        * df_selected["RNA_Score"]
+        * df_selected["Bonus"]
     )
     logger.info("Computed Ranking_Score for all selected epitopes.")
 
-    # Sort by Ranking_Score descending.
-    df_best.sort_values("Ranking_Score", ascending=False, inplace=True)
-    if df_best["Ranking_Score"].max() == 0:
+    df_selected.sort_values("Ranking_Score", ascending=False, inplace=True)
+    if df_selected["Ranking_Score"].max() == 0:
         logger.warning("All ranking scores are 0. Check thresholds and input data.")
 
-    # Write full ranked TSV.
+    # === Collapse duplicate peptides in two steps ===
+    # Use the peptide column as specified by the parameter.
+    if merged["col_mt_epitope_seq"] not in df_selected.columns:
+        logger.error(
+            "Required peptide column '{}' not found in data.",
+            merged["col_mt_epitope_seq"],
+        )
+        sys.exit(1)
+    peptide_col = merged["col_mt_epitope_seq"]
+
+    def collapse_peptide(group):
+        # Collapse across mutations using "Mutation Description"
+        muts = group.groupby("Mutation Description", as_index=False)[
+            "Mutant_RNA_Expression"
+        ].max()
+        best_mut_desc = muts.loc[muts["Mutant_RNA_Expression"].idxmax()][
+            "Mutation Description"
+        ]
+        subset = group[group["Mutation Description"] == best_mut_desc]
+        best_row = subset.loc[subset["Sum_MHC_Score"].idxmax()]
+        return best_row
+
+    df_collapsed = df_selected.groupby(peptide_col, as_index=False).apply(
+        collapse_peptide
+    )
+    df_collapsed.reset_index(drop=True, inplace=True)
+    # Re-sort collapsed results by Ranking_Score descending
+    df_collapsed = df_collapsed.sort_values("Ranking_Score", ascending=False)
+
+    logger.info(
+        "Collapsed duplicate peptides: {} rows remain after collapsing.",
+        df_collapsed.shape[0],
+    )
+
+    # Write outputs.
     try:
-        df_best.to_csv(all_output, sep="\t", index=False)
-        logger.info("Wrote all epitopes to {}", all_output)
+        df_collapsed.to_csv(all_output, sep="\t", index=False)
+        logger.info("Wrote all collapsed epitopes to {}", all_output)
     except Exception as e:
         logger.error("Error writing {}: {}", all_output, e)
-
-    # Write top-n TSV.
     try:
-        top_df = df_best.head(top_n)
+        top_df = df_collapsed.head(top_n)
         top_df.to_csv(top_output, sep="\t", index=False)
-        logger.info("Wrote top {} epitopes to {}", top_n, top_output)
+        logger.info("Wrote top {} collapsed epitopes to {}", top_n, top_output)
     except Exception as e:
         logger.error("Error writing {}: {}", top_output, e)
-
-    # Log summary counts for HLA Allele and Gene Name among the top n.
-    if "HLA Allele" in df_best.columns:
+    if "HLA Allele" in df_collapsed.columns:
         hla_counts = top_df["HLA Allele"].value_counts()
         logger.info("Top {} HLA Allele counts:\n{}", top_n, hla_counts.to_string())
     else:
         logger.warning("Column 'HLA Allele' not found.")
-    if "Gene Name" in df_best.columns:
-        gene_counts = top_df["Gene Name"].value_counts()
-        logger.info("Top {} Gene Name counts:\n{}", top_n, gene_counts.to_string())
-    else:
-        logger.warning("Column 'Gene Name' not found.")
-
     logger.info("Processing complete.")
 
 
