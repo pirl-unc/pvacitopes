@@ -244,10 +244,10 @@ def main(
     max_threshold_mhcflurry_presentation_score: float = 0.95,
     num_threshold_mhcflurry_presentation_score: int = 4,
     step_type_mhcflurry_pres: str = "adaptive",
-    min_threshold_netmhcpanel_el_percentile: float = 0.25,
-    max_threshold_netmhcpanel_el_percentile: float = 2,
-    num_threshold_netmhcpanel_el_percentile: int = 4,
-    step_type_netmhcpanel_el: str = "log2",
+    min_threshold_netmhcpan_el_percentile: float = 0.25,
+    max_threshold_netmhcpan_el_percentile: float = 2,
+    num_threshold_netmhcpan_el_percentile: int = 4,
+    step_type_netmhcpan_el: str = "log2",
     min_threshold_mhcflurry_presentation_percentile: float = 0.25,
     max_threshold_mhcflurry_presentation_percentile: float = 2,
     num_threshold_mhcflurry_presentation_percentile: int = 4,
@@ -274,7 +274,7 @@ def main(
     col_gene_name: str = "Gene Name",
     col_mutation: str = "Mutation",
     col_mhcflurry_presentation: str = "MHCflurryEL Presentation MT Score",
-    col_netmhcpanel_el: str = "NetMHCpanEL MT Percentile",
+    col_netmhcpan_el: str = "NetMHCpanEL MT Percentile",
     col_mhcflurry_presentation_percentile: str = "MHCflurryEL Presentation MT Percentile",
     col_netmhcpan_ba: str = "NetMHCpan MT IC50 Score",
     col_netmhcpan_percentile: str = "NetMHCpan MT Percentile",
@@ -346,16 +346,16 @@ def main(
         "num_threshold_mhcflurry_presentation_score"
     ]
     step_type_mhcflurry_pres = merged["step_type_mhcflurry_pres"]
-    min_threshold_netmhcpanel_el_percentile = merged[
-        "min_threshold_netmhcpanel_el_percentile"
+    min_threshold_netmhcpan_el_percentile = merged[
+        "min_threshold_netmhcpan_el_percentile"
     ]
-    max_threshold_netmhcpanel_el_percentile = merged[
-        "max_threshold_netmhcpanel_el_percentile"
+    max_threshold_netmhcpan_el_percentile = merged[
+        "max_threshold_netmhcpan_el_percentile"
     ]
-    num_threshold_netmhcpanel_el_percentile = merged[
-        "num_threshold_netmhcpanel_el_percentile"
+    num_threshold_netmhcpan_el_percentile = merged[
+        "num_threshold_netmhcpan_el_percentile"
     ]
-    step_type_netmhcpanel_el = merged["step_type_netmhcpanel_el"]
+    step_type_netmhcpan_el = merged["step_type_netmhcpan_el"]
     min_threshold_mhcflurry_presentation_percentile = merged[
         "min_threshold_mhcflurry_presentation_percentile"
     ]
@@ -389,7 +389,7 @@ def main(
     col_gene_name = merged["col_gene_name"]
     col_mutation = merged["col_mutation"]
     col_mhcflurry_presentation = merged["col_mhcflurry_presentation"]
-    col_netmhcpanel_el = merged["col_netmhcpanel_el"]
+    col_netmhcpan_el = merged["col_netmhcpan_el"]
     col_mhcflurry_presentation_percentile = merged[
         "col_mhcflurry_presentation_percentile"
     ]
@@ -429,7 +429,7 @@ def main(
         col_gene_name: "Gene Name",
         col_mutation: "Mutation",
         col_mhcflurry_presentation: "MHCflurryEL Presentation MT Score",
-        col_netmhcpanel_el: "NetMHCpanEL MT Percentile",
+        col_netmhcpan_el: "NetMHCpanEL MT Percentile",
         col_mhcflurry_presentation_percentile: "MHCflurryEL Presentation MT Percentile",
         col_netmhcpan_ba: "NetMHCpan MT IC50 Score",
         col_netmhcpan_percentile: "NetMHCpan MT Percentile",
@@ -474,22 +474,22 @@ def main(
         sys.exit(1)
 
     # NetMHCpanEL Percentile:
-    if step_type_netmhcpanel_el.lower() == "linear":
-        thr_netmhcpanel_el = np.linspace(
-            max_threshold_netmhcpanel_el_percentile,
-            min_threshold_netmhcpanel_el_percentile,
-            num_threshold_netmhcpanel_el_percentile,
+    if step_type_netmhcpan_el.lower() == "linear":
+        thr_netmhcpan_el = np.linspace(
+            max_threshold_netmhcpan_el_percentile,
+            min_threshold_netmhcpan_el_percentile,
+            num_threshold_netmhcpan_el_percentile,
         )
-    elif step_type_netmhcpanel_el.lower() == "log2":
-        thr_netmhcpanel_el = np.geomspace(
-            max_threshold_netmhcpanel_el_percentile,
-            min_threshold_netmhcpanel_el_percentile,
-            num=num_threshold_netmhcpanel_el_percentile,
+    elif step_type_netmhcpan_el.lower() == "log2":
+        thr_netmhcpan_el = np.geomspace(
+            max_threshold_netmhcpan_el_percentile,
+            min_threshold_netmhcpan_el_percentile,
+            num=num_threshold_netmhcpan_el_percentile,
         )
     else:
         logger.error(
             "Invalid step type for netmhcpanel el percentile: {}",
-            step_type_netmhcpanel_el,
+            step_type_netmhcpan_el,
         )
         sys.exit(1)
 
@@ -551,14 +551,14 @@ def main(
 
     # Round thresholds to 2 decimals.
     thr_mhcflurry_pres = np.round(thr_mhcflurry_pres, 2)
-    thr_netmhcpanel_el = np.round(thr_netmhcpanel_el, 2)
+    thr_netmhcpan_el = np.round(thr_netmhcpan_el, 2)
     thr_mhcflurry_pres_pct = np.round(thr_mhcflurry_pres_pct, 2)
     thr_netmhcpan_ba = np.round(thr_netmhcpan_ba, 2)
     thr_netmhcpan_pct = np.round(thr_netmhcpan_pct, 2)
 
     logger.info("Generated thresholds:")
     logger.info("filter: mhcflurry presentation > thresholds: {}", thr_mhcflurry_pres)
-    logger.info("filter: netmhcpan el percentile < thresholds: {}", thr_netmhcpanel_el)
+    logger.info("filter: netmhcpan el percentile < thresholds: {}", thr_netmhcpan_el)
     logger.info(
         "filter: mhcflurry presentation percentile < thresholds: {}",
         thr_mhcflurry_pres_pct,
@@ -572,7 +572,7 @@ def main(
         colname = f"filter: mhcflurry presentation > {thr:.2f}"
         df[colname] = (df["MHCflurryEL Presentation MT Score"] > thr).astype(int)
         bool_cols.append(colname)
-    for thr in thr_netmhcpanel_el:
+    for thr in thr_netmhcpan_el:
         colname = f"filter: netmhcpan el percentile < {thr:.2f}"
         df[colname] = (df["NetMHCpanEL MT Percentile"] < thr).astype(int)
         bool_cols.append(colname)
