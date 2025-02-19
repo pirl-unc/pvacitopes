@@ -2,24 +2,36 @@
 """
 A tool to process TSV files of predicted mutant epitopes and rank them.
 
-It:
-  - Reads an input TSV file.
-  - Groups rows by mutation.
-  - For each mutation, selects the best transcript based on expression, biotype,
-    transcript support level, and mutation position.
-  - Logs decisions using Loguru (including dependency versions).
-  - Creates per-threshold boolean columns for several MHC metrics. For each metric you can choose a step type:
-       * For MHCflurry Presentation Score (MT Score), step type can be:
-             - "linear": evenly spaced between min and max,
-             - "log2": geometric (log₂–spaced) between max and min,
-             - "adaptive": an adaptive scheme that (for the default range) yields values as close as possible to [0.5, 0.75, 0.9, 0.95] for 4 thresholds and [0.5, 0.75, 0.85, 0.9, 0.95] for 5.
-       * For the other metrics (NetMHCpanEL Percentile, MHCflurry Presentation Percentile,
-         NetMHCpan MT IC50 Score, and NetMHCpan MT Percentile) the step type can be "linear" or "log2" (defaulting to log2).
-  - Computes Sum_MHC_Score as the sum of these boolean columns.
-  - Flags frameshift mutations and computes a DNA_Score.
-  - Computes the final Ranking_Score.
-  - Outputs the full ranking TSV and the top‑n epitopes TSV.
-  - Logs a summary of HLA allele counts and gene counts for the top‑n epitopes.
+Pipeline:
+  1. Reads an input TSV file.
+  2. Computes MHC threshold boolean columns (with clean names starting with "filter:")
+     for five metrics:
+         - MHCflurryEL Presentation MT Score (> threshold)
+         - NetMHCpanEL MT Percentile (< threshold)
+         - MHCflurryEL Presentation MT Percentile (< threshold)
+         - NetMHCpan MT IC50 Score (< threshold)
+         - NetMHCpan MT Percentile (< threshold)
+     For MHCflurry Presentation Score, an adaptive scheme (by default) is used so that
+     for the default range (0.5 to 0.95) and 4 thresholds you get values close to:
+         [0.50, 0.75, 0.90, 0.95]; if the number increases (e.g. to 5) then roughly
+         [0.50, 0.75, 0.85, 0.90, 0.95]. (For the other metrics, the default step type is “log2”.)
+  3. Sums these boolean columns into a per‐row "Sum_MHC_Score" and discards rows with a zero score.
+  4. Groups the remaining rows by mutation (Chromosome, Start, Stop, Reference, Variant, Gene Name)
+     and selects the best transcript based on:
+         - Highest Transcript Expression (within 10% of max)
+         - Preference for protein_coding
+         - Best (lowest) Transcript Support Level
+         - Highest Protein Position
+         - Lexicographic tie-breaker on Transcript.
+  5. Computes additional scores:
+         - "filter: frameshift": a numeric (0/1) flag for frameshift mutations.
+         - "RNA_Score": computed from Transcript Expression using a transformation chosen
+           by the parameter `rna_transform` ("linear", "sqrt", or "log2").
+         - "DNA_Score": defined as min(1, Tumor DNA VAF / median(Tumor DNA VAF)).
+         - "Bonus": applied if the mutation is a frameshift.
+         - Final "Ranking_Score" = Sum_MHC_Score * DNA_Score * RNA_Score * Bonus.
+  6. Outputs a full TSV (sorted descending by Ranking_Score) and a top‑n TSV.
+  7. Logs summary counts for HLA Allele and Gene Name among the top‑n.
   
 Usage:
     python rank_epitopes.py --input-file INPUT.tsv [options]
@@ -31,9 +43,9 @@ import numpy as np
 import pandas as pd
 import argh
 from loguru import logger
-import loguru  # to log its version
+import loguru  # for version logging
 
-# Configure loguru: log dependency versions.
+# Configure loguru.
 logger.remove()  # remove default handler
 logger.add(sys.stderr, level="INFO")
 logger.info("Pandas version: {}", pd.__version__)
@@ -49,7 +61,7 @@ def get_tsl_value(tsl: str) -> float:
         tsl (str): The TSL value, e.g. "TSL1" or "1".
 
     Returns:
-        float: A numeric value corresponding to the TSL.
+        float: A numeric value.
     """
     try:
         return float(tsl)
@@ -62,26 +74,24 @@ def get_tsl_value(tsl: str) -> float:
 
 def select_best_transcript(group: pd.DataFrame, log_ctx: logger) -> pd.Series:
     """
-    Select the best transcript from a group of rows representing the same mutation.
-
-    Selection is performed by:
-      1. Filtering for transcripts with Transcript Expression within 10% of the maximum.
-      2. Preferring transcripts with 'protein_coding' biotype.
-      3. Choosing the transcript with the lowest Transcript Support Level.
-      4. Choosing the transcript with the highest Protein Position.
-      5. Finally, breaking ties lexicographically by Transcript.
+    Select the best transcript from a group (all rows for a given mutation)
+    based on:
+      1. Transcript Expression (within 10% of the maximum)
+      2. Preference for protein_coding biotype
+      3. Lowest Transcript Support Level
+      4. Highest Protein Position
+      5. Lexicographic order on Transcript.
 
     Args:
-        group (pd.DataFrame): DataFrame of transcripts for a mutation.
-        log_ctx (logger): Logger for recording decision steps.
+        group (pd.DataFrame): Group of transcripts for one mutation.
+        log_ctx (logger): Logger for decision messages.
 
     Returns:
-        pd.Series: The chosen transcript row.
+        pd.Series: The selected transcript row.
     """
     group = group.copy()
     decision_notes = []
-
-    # Ensure numeric conversion.
+    # Convert to numeric.
     group["Transcript Expression"] = pd.to_numeric(
         group["Transcript Expression"], errors="coerce"
     )
@@ -89,21 +99,21 @@ def select_best_transcript(group: pd.DataFrame, log_ctx: logger) -> pd.Series:
         group["Protein Position"], errors="coerce"
     )
 
-    # 1. Filter for highest Transcript Expression (within 10% of max).
+    # 1. Filter: keep transcripts within 10% of max expression.
     max_expr = group["Transcript Expression"].max()
     expr_threshold = 0.9 * max_expr
     candidates = group[group["Transcript Expression"] >= expr_threshold]
     decision_notes.append(
-        f"Max Expression: {max_expr:.3f}, threshold: {expr_threshold:.3f} (candidates: {len(candidates)})"
+        f"Max Expression: {max_expr:.3f} (threshold: {expr_threshold:.3f}), candidates: {len(candidates)}"
     )
 
-    # 2. Prefer protein_coding biotype.
+    # 2. Prefer protein_coding.
     if (candidates["Biotype"] == "protein_coding").any():
         candidates_pc = candidates[candidates["Biotype"] == "protein_coding"]
-        decision_notes.append(f"Filtered by protein_coding: {len(candidates_pc)}")
+        decision_notes.append(f"Filtered protein_coding: {len(candidates_pc)}")
         candidates = candidates_pc
 
-    # 3. Prefer best (lowest) TSL.
+    # 3. Prefer lowest TSL.
     candidates["TSL_numeric"] = candidates["Transcript Support Level"].apply(
         get_tsl_value
     )
@@ -111,7 +121,7 @@ def select_best_transcript(group: pd.DataFrame, log_ctx: logger) -> pd.Series:
     candidates = candidates[candidates["TSL_numeric"] == best_tsl]
     decision_notes.append(f"Best TSL: {best_tsl}, candidates: {len(candidates)}")
 
-    # 4. Prefer highest Protein Position.
+    # 4. Prefer highest protein position.
     best_protein_pos = candidates["Protein Position"].max()
     candidates = candidates[candidates["Protein Position"] == best_protein_pos]
     decision_notes.append(
@@ -134,27 +144,26 @@ def adaptive_thresholds(min_val: float, max_val: float, num: int) -> np.ndarray:
     """
     Generate adaptive thresholds for MHCflurry presentation score.
 
-    The scheme fixes the first threshold to min_val and the last to max_val.
-    For num>=3, the intermediate thresholds are chosen such that for the default range
-    (min=0.5, max=0.95) you get values close to:
-        n=4: [0.5, 0.75, 0.90, 0.95]
-        n=5: [0.5, 0.75, 0.85, 0.90, 0.95]
-    For other ranges, the intermediate thresholds are linearly spaced between
-    positions 0.5556 and 0.8889 (the normalized anchors corresponding to the default).
+    The first value is fixed to min_val and the last to max_val.
+    For num>=3, intermediate thresholds are chosen so that for the default
+    range (0.5 to 0.95) you get values close to:
+       n=4: [0.50, 0.75, 0.90, 0.95]
+       n=5: [0.50, 0.75, 0.85, 0.90, 0.95]
+    For other ranges, intermediate thresholds are linearly interpolated using
+    normalized anchors 0.5556 and 0.8889.
 
     Args:
-        min_val (float): The minimum threshold value.
-        max_val (float): The maximum threshold value.
-        num (int): The total number of thresholds.
+        min_val (float): Minimum threshold.
+        max_val (float): Maximum threshold.
+        num (int): Total number of thresholds.
 
     Returns:
-        np.ndarray: An array of thresholds.
+        np.ndarray: Array of thresholds.
     """
     if num == 1:
         return np.array([min_val])
     if num == 2:
         return np.array([min_val, max_val])
-    # For n>=3, fix first and last; interpolate intermediate normalized positions.
     intermediate = np.linspace(0.5556, 0.8889, num - 2)
     thresholds = (
         [min_val]
@@ -171,27 +180,28 @@ def main(
     top_n: int = 50,
     bonus_multiplier: int = 5,
     log_file: str = "log.txt",
-    # For MHCflurry Presentation MT Score thresholds (condition: value > threshold)
+    rna_transform: str = "sqrt",  # Options: "linear", "sqrt", "log2"
+    # MHCflurry Presentation MT Score thresholds (condition: value > threshold)
     min_threshold_mhcflurry_presentation_score: float = 0.5,
     max_threshold_mhcflurry_presentation_score: float = 0.95,
     num_threshold_mhcflurry_presentation_score: int = 4,
     step_type_mhcflurry_pres: str = "adaptive",  # "linear", "log2", or "adaptive"
-    # For NetMHCpanEL MT Percentile thresholds (condition: value < threshold)
+    # NetMHCpanEL MT Percentile thresholds (condition: value < threshold)
     min_threshold_netmhcpanel_el_percentile: float = 0.25,
     max_threshold_netmhcpanel_el_percentile: float = 2,
     num_threshold_netmhcpanel_el_percentile: int = 4,
     step_type_netmhcpanel_el: str = "log2",  # "linear" or "log2"
-    # For MHCflurry Presentation MT Percentile thresholds.
+    # MHCflurry Presentation MT Percentile thresholds.
     min_threshold_mhcflurry_presentation_percentile: float = 0.25,
     max_threshold_mhcflurry_presentation_percentile: float = 2,
     num_threshold_mhcflurry_presentation_percentile: int = 4,
     step_type_mhcflurry_pres_pct: str = "log2",  # "linear" or "log2"
-    # For NetMHCpan MT IC50 Score thresholds (condition: value < threshold)
+    # NetMHCpan MT IC50 Score thresholds (condition: value < threshold)
     min_threshold_netmhcpan_ba: float = 125,
     max_threshold_netmhcpan_ba: float = 1000,
     num_threshold_netmhcpan_ba: int = 4,
     step_type_netmhcpan_ba: str = "log2",  # "linear" or "log2"
-    # For NetMHCpan MT Percentile thresholds.
+    # NetMHCpan MT Percentile thresholds.
     min_threshold_netmhcpan_percentile: float = 0.25,
     max_threshold_netmhcpan_percentile: float = 2,
     num_threshold_netmhcpan_percentile: int = 4,
@@ -200,41 +210,20 @@ def main(
     """
     Process the mutant epitope TSV file and output ranked epitopes.
 
-    The function:
-      1. Reads the input TSV file.
-      2. Groups rows by mutation (Chromosome, Start, Stop, Reference, Variant, Gene Name).
-      3. For each mutation, selects the best transcript based on:
-         - Highest Transcript Expression (within 10% of max),
-         - Preference for protein_coding,
-         - Lowest Transcript Support Level,
-         - Highest Protein Position,
-         - Lexicographic tie-breaker on Transcript.
-      4. Logs decisions and dependency versions.
-      5. For five MHC metrics, creates per-threshold boolean columns. For the
-         MHCflurry Presentation MT Score, the step type can be:
-             "linear" (even spacing), "log2" (geometric spacing), or "adaptive"
-             (an adaptive scheme that approximates default values such as
-             [0.5, 0.75, 0.9, 0.95] when min=0.5 and max=0.95).
-         For the other metrics, the step type can be "linear" or "log2" (default "log2").
-      6. Computes Sum_MHC_Score as the sum of these boolean columns.
-      7. Flags frameshift mutations and computes a DNA_Score.
-      8. Computes the final Ranking_Score.
-      9. Outputs the full ranking and the top‑n epitopes as TSV files.
-      10. Logs summary counts for HLA alleles and gene names for the top‑n epitopes.
+    This version first applies MHC filtering (keeping only rows with a positive Sum_MHC_Score)
+    and then selects the best transcript per mutation.
 
     Args:
-        input_file (str): Path to the input TSV file.
-        all_output (str): Output TSV file for all epitopes.
-        top_output (str): Output TSV file for top epitopes.
+        input_file (str): Path to input TSV.
+        all_output (str): Path for output TSV with all epitopes.
+        top_output (str): Path for output TSV with top epitopes.
         top_n (int): Number of top epitopes to output.
-        bonus_multiplier (int): Bonus multiplier if the mutation is a frameshift.
-        log_file (str): Path to the log file.
-        (Threshold parameters follow; note that min and max may be anywhere between 0 and 1.)
-
-    Returns:
-        None
+        bonus_multiplier (int): Bonus multiplier if mutation is frameshift.
+        log_file (str): Path to log file.
+        rna_transform (str): Transformation for RNA_Score ("linear", "sqrt", or "log2").
+        (The remaining parameters define thresholds for each MHC metric.)
     """
-    # Add file handler for loguru.
+    # Add log file handler.
     logger.add(
         log_file,
         level="INFO",
@@ -247,10 +236,10 @@ def main(
     try:
         df = pd.read_csv(input_file, sep="\t")
     except Exception as e:
-        logger.error("Error reading input file {}: {}", input_file, e)
+        logger.error("Error reading {}: {}", input_file, e)
         sys.exit(1)
 
-    # Check for required columns.
+    # Check required columns.
     required_columns = [
         "Chromosome",
         "Start",
@@ -277,27 +266,8 @@ def main(
         logger.error("Missing required columns: {}", missing)
         sys.exit(1)
 
-    # Group by mutation.
-    mutation_cols = ["Chromosome", "Start", "Stop", "Reference", "Variant", "Gene Name"]
-    groups = df.groupby(mutation_cols, as_index=False)
-
-    selected = []
-    for name, group in groups:
-        try:
-            chosen = select_best_transcript(group, logger)
-            selected.append(chosen)
-        except Exception as ex:
-            logger.error(
-                "Error selecting best transcript for mutation {}: {}", name, ex
-            )
-    if not selected:
-        logger.error("No transcripts selected; exiting.")
-        sys.exit(1)
-    df_best = pd.DataFrame(selected)
-    logger.info("Selected best transcript for {} mutations.", len(df_best))
-
-    # === Build threshold arrays ===
-    # MHCflurry Presentation MT Score thresholds.
+    # === Compute MHC boolean columns on the full DataFrame ===
+    # MHCflurry Presentation Score:
     stype = step_type_mhcflurry_pres.lower()
     if stype == "adaptive":
         thr_mhcflurry_pres = adaptive_thresholds(
@@ -319,12 +289,12 @@ def main(
         )
     else:
         logger.error(
-            "Invalid step type for MHCflurry presentation score: {}",
+            "Invalid step type for mhcflurry presentation score: {}",
             step_type_mhcflurry_pres,
         )
         sys.exit(1)
 
-    # For NetMHCpanEL MT Percentile thresholds.
+    # NetMHCpanEL Percentile:
     if step_type_netmhcpanel_el.lower() == "linear":
         thr_netmhcpanel_el = np.linspace(
             max_threshold_netmhcpanel_el_percentile,
@@ -339,11 +309,12 @@ def main(
         )
     else:
         logger.error(
-            "Invalid step type for NetMHCpanEL percentile: {}", step_type_netmhcpanel_el
+            "Invalid step type for netmhcpan el percentile: {}",
+            step_type_netmhcpanel_el,
         )
         sys.exit(1)
 
-    # For MHCflurry Presentation MT Percentile thresholds.
+    # MHCflurry Presentation Percentile:
     if step_type_mhcflurry_pres_pct.lower() == "linear":
         thr_mhcflurry_pres_pct = np.linspace(
             max_threshold_mhcflurry_presentation_percentile,
@@ -358,12 +329,12 @@ def main(
         )
     else:
         logger.error(
-            "Invalid step type for MHCflurry presentation percentile: {}",
+            "Invalid step type for mhcflurry presentation percentile: {}",
             step_type_mhcflurry_pres_pct,
         )
         sys.exit(1)
 
-    # For NetMHCpan MT IC50 Score thresholds.
+    # NetMHCpan BA Score:
     if step_type_netmhcpan_ba.lower() == "linear":
         thr_netmhcpan_ba = np.linspace(
             max_threshold_netmhcpan_ba,
@@ -377,10 +348,10 @@ def main(
             num=num_threshold_netmhcpan_ba,
         )
     else:
-        logger.error("Invalid step type for NetMHCpan BA: {}", step_type_netmhcpan_ba)
+        logger.error("Invalid step type for netmhcpan BA: {}", step_type_netmhcpan_ba)
         sys.exit(1)
 
-    # For NetMHCpan MT Percentile thresholds.
+    # NetMHCpan Percentile:
     if step_type_netmhcpan_pct.lower() == "linear":
         thr_netmhcpan_pct = np.linspace(
             max_threshold_netmhcpan_percentile,
@@ -395,11 +366,11 @@ def main(
         )
     else:
         logger.error(
-            "Invalid step type for NetMHCpan percentile: {}", step_type_netmhcpan_pct
+            "Invalid step type for netmhcpan percentile: {}", step_type_netmhcpan_pct
         )
         sys.exit(1)
 
-    # Round threshold values to two decimals for display and for column names.
+    # Round thresholds to 2 decimals.
     thr_mhcflurry_pres = np.round(thr_mhcflurry_pres, 2)
     thr_netmhcpanel_el = np.round(thr_netmhcpanel_el, 2)
     thr_mhcflurry_pres_pct = np.round(thr_mhcflurry_pres_pct, 2)
@@ -407,51 +378,71 @@ def main(
     thr_netmhcpan_pct = np.round(thr_netmhcpan_pct, 2)
 
     logger.info("Generated thresholds:")
-    logger.info("MHCflurry Presentation Score thresholds (>): {}", thr_mhcflurry_pres)
-    logger.info("NetMHCpanEL Percentile thresholds (<): {}", thr_netmhcpanel_el)
+    logger.info("filter: mhcflurry presentation > thresholds: {}", thr_mhcflurry_pres)
+    logger.info("filter: netmhcpan el percentile < thresholds: {}", thr_netmhcpanel_el)
     logger.info(
-        "MHCflurry Presentation Percentile thresholds (<): {}", thr_mhcflurry_pres_pct
+        "filter: mhcflurry presentation percentile < thresholds: {}",
+        thr_mhcflurry_pres_pct,
     )
-    logger.info("NetMHCpan BA Score thresholds (<) [log2 spaced]: {}", thr_netmhcpan_ba)
-    logger.info("NetMHCpan Percentile thresholds (<): {}", thr_netmhcpan_pct)
+    logger.info("filter: netmhcpan BA < thresholds: {}", thr_netmhcpan_ba)
+    logger.info("filter: netmhcpan percentile < thresholds: {}", thr_netmhcpan_pct)
 
-    # === Create boolean columns for each threshold (with searchable prefixes) ===
-    threshold_columns = []
+    # Create boolean columns with clean names.
+    bool_cols = []
     for thr in thr_mhcflurry_pres:
-        colname = f"thr_mhcflurry_pres_gt_{thr:.2f}"
-        df_best[colname] = (df_best["MHCflurryEL Presentation MT Score"] > thr).astype(
-            int
-        )
-        threshold_columns.append(colname)
+        colname = f"filter: mhcflurry presentation > {thr:.2f}"
+        df[colname] = (df["MHCflurryEL Presentation MT Score"] > thr).astype(int)
+        bool_cols.append(colname)
     for thr in thr_netmhcpanel_el:
-        colname = f"thr_netmhcpanel_el_lt_{thr:.2f}"
-        df_best[colname] = (df_best["NetMHCpanEL MT Percentile"] < thr).astype(int)
-        threshold_columns.append(colname)
+        colname = f"filter: netmhcpan el percentile < {thr:.2f}"
+        df[colname] = (df["NetMHCpanEL MT Percentile"] < thr).astype(int)
+        bool_cols.append(colname)
     for thr in thr_mhcflurry_pres_pct:
-        colname = f"thr_mhcflurry_pres_pct_lt_{thr:.2f}"
-        df_best[colname] = (
-            df_best["MHCflurryEL Presentation MT Percentile"] < thr
-        ).astype(int)
-        threshold_columns.append(colname)
+        colname = f"filter: mhcflurry presentation percentile < {thr:.2f}"
+        df[colname] = (df["MHCflurryEL Presentation MT Percentile"] < thr).astype(int)
+        bool_cols.append(colname)
     for thr in thr_netmhcpan_ba:
-        colname = f"thr_netmhcpan_ba_lt_{thr:.2f}"
-        df_best[colname] = (df_best["NetMHCpan MT IC50 Score"] < thr).astype(int)
-        threshold_columns.append(colname)
+        colname = f"filter: netmhcpan BA < {thr:.2f}"
+        df[colname] = (df["NetMHCpan MT IC50 Score"] < thr).astype(int)
+        bool_cols.append(colname)
     for thr in thr_netmhcpan_pct:
-        colname = f"thr_netmhcpan_pct_lt_{thr:.2f}"
-        df_best[colname] = (df_best["NetMHCpan MT Percentile"] < thr).astype(int)
-        threshold_columns.append(colname)
+        colname = f"filter: netmhcpan percentile < {thr:.2f}"
+        df[colname] = (df["NetMHCpan MT Percentile"] < thr).astype(int)
+        bool_cols.append(colname)
 
-    # Compute Sum_MHC_Score from the threshold columns.
-    df_best["Sum_MHC_Score"] = df_best[threshold_columns].sum(axis=1)
-    logger.info("Computed Sum_MHC_Score for all epitopes.")
+    # Compute Sum_MHC_Score for each row.
+    df["Sum_MHC_Score"] = df[bool_cols].sum(axis=1)
+    logger.info("Computed Sum_MHC_Score for all rows.")
 
-    # Flag frameshift mutations.
-    df_best["Is_Frameshift"] = df_best["Mutation"].str.contains(
-        "fs|frameshift", flags=re.IGNORECASE, na=False
+    # Filter out rows with Sum_MHC_Score == 0.
+    df = df[df["Sum_MHC_Score"] > 0]
+    logger.info("Filtered to {} rows with Sum_MHC_Score > 0.", len(df))
+
+    # === Group by mutation and select best transcript per mutation ===
+    mutation_cols = ["Chromosome", "Start", "Stop", "Reference", "Variant", "Gene Name"]
+    groups = df.groupby(mutation_cols, as_index=False)
+    selected = []
+    for name, group in groups:
+        try:
+            chosen = select_best_transcript(group, logger)
+            selected.append(chosen)
+        except Exception as ex:
+            logger.error("Error selecting transcript for mutation {}: {}", name, ex)
+    if not selected:
+        logger.error("No transcripts selected after filtering; exiting.")
+        sys.exit(1)
+    df_best = pd.DataFrame(selected)
+    logger.info("Selected best transcript for {} mutations.", len(df_best))
+
+    # === Compute additional scores ===
+    # Create a numeric frameshift flag with "filter:" prefix.
+    df_best["filter: frameshift"] = (
+        df_best["Mutation"]
+        .str.contains("fs|frameshift", flags=re.IGNORECASE, na=False)
+        .astype(int)
     )
 
-    # Compute DNA_Score: min(1, Tumor DNA VAF / median(Tumor DNA VAF)).
+    # Compute DNA_Score = min(1, Tumor DNA VAF / median(Tumor DNA VAF)).
     median_dna_vaf = df_best["Tumor DNA VAF"].median()
     if median_dna_vaf == 0:
         logger.warning(
@@ -461,53 +452,66 @@ def main(
     else:
         df_best["DNA_Score"] = (df_best["Tumor DNA VAF"] / median_dna_vaf).clip(upper=1)
 
-    # Apply bonus for frameshift mutations.
-    df_best["Bonus"] = np.where(df_best["Is_Frameshift"], bonus_multiplier, 1)
+    # Compute RNA_Score from Transcript Expression based on transformation.
+    try:
+        expr = df_best["Transcript Expression"].astype(float)
+    except Exception as e:
+        logger.error("Error converting Transcript Expression to float: {}", e)
+        sys.exit(1)
+    rna_trans = rna_transform.lower()
+    if rna_trans == "linear":
+        df_best["RNA_Score"] = expr
+    elif rna_trans == "sqrt":
+        df_best["RNA_Score"] = np.sqrt(expr)
+    elif rna_trans == "log2":
+        df_best["RNA_Score"] = np.log2(expr + 1)
+    else:
+        logger.error("Invalid RNA transform: {}", rna_transform)
+        sys.exit(1)
 
-    # Compute final Ranking_Score.
+    # Apply bonus for frameshift mutations.
+    df_best["Bonus"] = np.where(df_best["filter: frameshift"] == 1, bonus_multiplier, 1)
+
+    # Compute final Ranking_Score using RNA_Score.
     df_best["Ranking_Score"] = (
         df_best["Sum_MHC_Score"]
         * df_best["DNA_Score"]
-        * df_best["Transcript Expression"]
+        * df_best["RNA_Score"]
         * df_best["Bonus"]
     )
-    logger.info("Computed Ranking_Score for all epitopes.")
+    logger.info("Computed Ranking_Score for all selected epitopes.")
 
-    # Sort by Ranking_Score descending (higher is better).
+    # Sort by Ranking_Score descending.
     df_best.sort_values("Ranking_Score", ascending=False, inplace=True)
-
     if df_best["Ranking_Score"].max() == 0:
-        logger.warning(
-            "All ranking scores are 0. Please check thresholds and input data."
-        )
+        logger.warning("All ranking scores are 0. Check thresholds and input data.")
 
-    # Write the complete ranked file.
+    # Write full ranked TSV.
     try:
         df_best.to_csv(all_output, sep="\t", index=False)
         logger.info("Wrote all epitopes to {}", all_output)
     except Exception as e:
-        logger.error("Error writing all epitopes file {}: {}", all_output, e)
+        logger.error("Error writing {}: {}", all_output, e)
 
-    # Write top-N epitopes.
+    # Write top-n TSV.
     try:
         top_df = df_best.head(top_n)
         top_df.to_csv(top_output, sep="\t", index=False)
         logger.info("Wrote top {} epitopes to {}", top_n, top_output)
     except Exception as e:
-        logger.error("Error writing top epitopes file {}: {}", top_output, e)
+        logger.error("Error writing {}: {}", top_output, e)
 
-    # Log summary counts for HLA allele and gene (Gene Name) for the top n.
+    # Log summary counts for HLA Allele and Gene Name among the top n.
     if "HLA Allele" in df_best.columns:
         hla_counts = top_df["HLA Allele"].value_counts()
         logger.info("Top {} HLA Allele counts:\n{}", top_n, hla_counts.to_string())
     else:
-        logger.warning("Column 'HLA Allele' not found in input data.")
-
+        logger.warning("Column 'HLA Allele' not found.")
     if "Gene Name" in df_best.columns:
         gene_counts = top_df["Gene Name"].value_counts()
         logger.info("Top {} Gene Name counts:\n{}", top_n, gene_counts.to_string())
     else:
-        logger.warning("Column 'Gene Name' not found in input data.")
+        logger.warning("Column 'Gene Name' not found.")
 
     logger.info("Processing complete.")
 
