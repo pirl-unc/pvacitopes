@@ -16,7 +16,7 @@ Pipeline:
          [0.50, 0.75, 0.90, 0.95]; if the number increases (e.g. to 5) then roughly
          [0.50, 0.75, 0.85, 0.90, 0.95]. (For the other metrics, the default step type is “log2”.)
   3. Sums these boolean columns into a per‐row "Sum_MHC_Score" and discards rows with a zero score.
-  4. Groups the remaining rows by mutation (Chromosome, Start, Stop, Reference, Variant, Gene Name)
+  4. Groups the remaining rows by mutation (using canonical columns)
      and selects the best transcript based on:
          - Highest Transcript Expression (within 10% of max)
          - Preference for protein_coding
@@ -32,18 +32,35 @@ Pipeline:
          - Final "Ranking_Score" = Sum_MHC_Score * DNA_Score * RNA_Score * Bonus.
   6. Outputs a full TSV (sorted descending by Ranking_Score) and a top‑n TSV.
   7. Logs summary counts for HLA Allele and Gene Name among the top‑n.
-  
+
 Usage:
-    python rank_epitopes.py --input-file INPUT.tsv [options]
+    python rank_epitopes.py --input-file INPUT.tsv [other options]
+
+New options allow:
+  - Overriding the names of key columns via CLI arguments.
+  - Logging the merged CLI arguments for reproducibility.
+  - Saving the merged CLI args to a JSON/YAML file.
+  - Loading a set of defaults from a JSON/YAML file, which can be overridden by CLI args.
 """
 
 import sys
 import re
+import json
+import os
+import inspect
 import numpy as np
 import pandas as pd
 import argh
 from loguru import logger
 import loguru  # for version logging
+
+# Try importing YAML support.
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 # Configure loguru.
 logger.remove()  # remove default handler
@@ -51,6 +68,46 @@ logger.add(sys.stderr, level="INFO")
 logger.info("Pandas version: {}", pd.__version__)
 logger.info("NumPy version: {}", np.__version__)
 logger.info("Loguru version: {}", loguru.__version__)
+
+
+def load_defaults_from_file(file_path: str) -> dict:
+    """Load defaults from a JSON or YAML file based on the file extension."""
+    _, ext = os.path.splitext(file_path)
+    try:
+        with open(file_path) as f:
+            if ext.lower() == ".json":
+                return json.load(f)
+            elif ext.lower() in [".yaml", ".yml"]:
+                if HAVE_YAML:
+                    return yaml.safe_load(f)
+                else:
+                    logger.error("YAML file provided but PyYAML is not installed.")
+                    sys.exit(1)
+            else:
+                # Default to JSON
+                return json.load(f)
+    except Exception as e:
+        logger.error("Error loading defaults from {}: {}", file_path, e)
+        sys.exit(1)
+
+
+def save_args_to_file(
+    args_dict: dict, file_path: str, file_format: str = "json"
+) -> None:
+    """Save the CLI arguments dictionary to a file in JSON or YAML format."""
+    try:
+        with open(file_path, "w") as f:
+            if file_format.lower() == "yaml":
+                if HAVE_YAML:
+                    yaml.dump(args_dict, f)
+                else:
+                    logger.error("YAML format selected but PyYAML is not installed.")
+                    sys.exit(1)
+            else:
+                json.dump(args_dict, f, indent=2)
+        logger.info("Saved CLI args to {}", file_path)
+    except Exception as e:
+        logger.error("Error saving CLI args to {}: {}", file_path, e)
 
 
 def get_tsl_value(tsl: str) -> float:
@@ -76,7 +133,7 @@ def select_best_transcript(group: pd.DataFrame, log_ctx: logger) -> pd.Series:
     """
     Select the best transcript from a group (all rows for a given mutation)
     based on:
-      1. Transcript Expression (within 10% of the maximum)
+      1. Transcript Expression (within 10% of max)
       2. Preference for protein_coding biotype
       3. Lowest Transcript Support Level
       4. Highest Protein Position
@@ -175,54 +232,172 @@ def adaptive_thresholds(min_val: float, max_val: float, num: int) -> np.ndarray:
 
 def main(
     input_file: str,
+    # Output options:
     all_output: str = "all-epitopes.tsv",
     top_output: str = "top-epitopes.tsv",
     top_n: int = 50,
     bonus_multiplier: int = 5,
     log_file: str = "log.txt",
-    rna_transform: str = "sqrt",  # Options: "linear", "sqrt", "log2"
-    # MHCflurry Presentation MT Score thresholds (condition: value > threshold)
+    rna_transform: str = "sqrt",
+    # Threshold parameters for MHC metrics:
     min_threshold_mhcflurry_presentation_score: float = 0.5,
     max_threshold_mhcflurry_presentation_score: float = 0.95,
     num_threshold_mhcflurry_presentation_score: int = 4,
-    step_type_mhcflurry_pres: str = "adaptive",  # "linear", "log2", or "adaptive"
-    # NetMHCpanEL MT Percentile thresholds (condition: value < threshold)
+    step_type_mhcflurry_pres: str = "adaptive",
     min_threshold_netmhcpanel_el_percentile: float = 0.25,
     max_threshold_netmhcpanel_el_percentile: float = 2,
     num_threshold_netmhcpanel_el_percentile: int = 4,
-    step_type_netmhcpanel_el: str = "log2",  # "linear" or "log2"
-    # MHCflurry Presentation MT Percentile thresholds.
+    step_type_netmhcpanel_el: str = "log2",
     min_threshold_mhcflurry_presentation_percentile: float = 0.25,
     max_threshold_mhcflurry_presentation_percentile: float = 2,
     num_threshold_mhcflurry_presentation_percentile: int = 4,
-    step_type_mhcflurry_pres_pct: str = "log2",  # "linear" or "log2"
-    # NetMHCpan MT IC50 Score thresholds (condition: value < threshold)
+    step_type_mhcflurry_pres_pct: str = "log2",
     min_threshold_netmhcpan_ba: float = 125,
     max_threshold_netmhcpan_ba: float = 1000,
     num_threshold_netmhcpan_ba: int = 4,
-    step_type_netmhcpan_ba: str = "log2",  # "linear" or "log2"
-    # NetMHCpan MT Percentile thresholds.
+    step_type_netmhcpan_ba: str = "log2",
     min_threshold_netmhcpan_percentile: float = 0.25,
     max_threshold_netmhcpan_percentile: float = 2,
     num_threshold_netmhcpan_percentile: int = 4,
-    step_type_netmhcpan_pct: str = "log2",  # "linear" or "log2"
+    step_type_netmhcpan_pct: str = "log2",
+    # Column name options:
+    col_chromosome: str = "Chromosome",
+    col_start: str = "Start",
+    col_stop: str = "Stop",
+    col_reference: str = "Reference",
+    col_variant: str = "Variant",
+    col_transcript: str = "Transcript",
+    col_transcript_support: str = "Transcript Support Level",
+    col_transcript_expression: str = "Transcript Expression",
+    col_biotype: str = "Biotype",
+    col_protein_position: str = "Protein Position",
+    col_gene_name: str = "Gene Name",
+    col_mutation: str = "Mutation",
+    col_mhcflurry_presentation: str = "MHCflurryEL Presentation MT Score",
+    col_netmhcpanel_el: str = "NetMHCpanEL MT Percentile",
+    col_mhcflurry_presentation_percentile: str = "MHCflurryEL Presentation MT Percentile",
+    col_netmhcpan_ba: str = "NetMHCpan MT IC50 Score",
+    col_netmhcpan_percentile: str = "NetMHCpan MT Percentile",
+    col_tumor_dna_vaf: str = "Tumor DNA VAF",
+    col_hla_allele: str = "HLA Allele",
+    # Defaults file options:
+    load_defaults: str = None,
+    save_args: str = None,
+    save_args_format: str = "json",
 ) -> None:
     """
     Process the mutant epitope TSV file and output ranked epitopes.
 
-    This version first applies MHC filtering (keeping only rows with a positive Sum_MHC_Score)
-    and then selects the best transcript per mutation.
-
-    Args:
-        input_file (str): Path to input TSV.
-        all_output (str): Path for output TSV with all epitopes.
-        top_output (str): Path for output TSV with top epitopes.
-        top_n (int): Number of top epitopes to output.
-        bonus_multiplier (int): Bonus multiplier if mutation is frameshift.
-        log_file (str): Path to log file.
-        rna_transform (str): Transformation for RNA_Score ("linear", "sqrt", or "log2").
-        (The remaining parameters define thresholds for each MHC metric.)
+    New options allow overriding column names as well as loading/saving default CLI args.
     """
+    # --- Implicitly build built-in defaults from main's signature ---
+    builtin_defaults = {
+        k: v.default
+        for k, v in inspect.signature(main).parameters.items()
+        if v.default is not inspect.Parameter.empty
+    }
+    # Build a dictionary of CLI args from the parameters of main.
+    cli_args = {k: locals()[k] for k in inspect.signature(main).parameters.keys()}
+
+    # If a defaults file is provided, load it.
+    if load_defaults is not None:
+        loaded_defaults = load_defaults_from_file(load_defaults)
+    else:
+        loaded_defaults = {}
+
+    # Merge: built‑in defaults < loaded defaults < CLI args.
+    merged = {}
+    for key in cli_args:
+        if key in builtin_defaults:
+            # If the CLI arg equals the built‐in default and a loaded default exists, use that.
+            if cli_args[key] == builtin_defaults[key] and key in loaded_defaults:
+                merged[key] = loaded_defaults[key]
+            else:
+                merged[key] = cli_args[key]
+        else:
+            # For required arguments (e.g. input_file) not in builtin_defaults.
+            merged[key] = cli_args[key]
+
+    # Log and optionally save the merged CLI arguments.
+    logger.info("Merged CLI arguments:")
+    for k, v in merged.items():
+        logger.info("  {}: {}", k, v)
+
+    if merged.get("save_args") is not None:
+        save_args_to_file(
+            merged, merged["save_args"], merged.get("save_args_format", "json")
+        )
+
+    # --- Use merged values in the rest of the code ---
+    input_file = merged["input_file"]
+    all_output = merged["all_output"]
+    top_output = merged["top_output"]
+    top_n = merged["top_n"]
+    bonus_multiplier = merged["bonus_multiplier"]
+    log_file = merged["log_file"]
+    rna_transform = merged["rna_transform"]
+    min_threshold_mhcflurry_presentation_score = merged[
+        "min_threshold_mhcflurry_presentation_score"
+    ]
+    max_threshold_mhcflurry_presentation_score = merged[
+        "max_threshold_mhcflurry_presentation_score"
+    ]
+    num_threshold_mhcflurry_presentation_score = merged[
+        "num_threshold_mhcflurry_presentation_score"
+    ]
+    step_type_mhcflurry_pres = merged["step_type_mhcflurry_pres"]
+    min_threshold_netmhcpanel_el_percentile = merged[
+        "min_threshold_netmhcpanel_el_percentile"
+    ]
+    max_threshold_netmhcpanel_el_percentile = merged[
+        "max_threshold_netmhcpanel_el_percentile"
+    ]
+    num_threshold_netmhcpanel_el_percentile = merged[
+        "num_threshold_netmhcpanel_el_percentile"
+    ]
+    step_type_netmhcpanel_el = merged["step_type_netmhcpanel_el"]
+    min_threshold_mhcflurry_presentation_percentile = merged[
+        "min_threshold_mhcflurry_presentation_percentile"
+    ]
+    max_threshold_mhcflurry_presentation_percentile = merged[
+        "max_threshold_mhcflurry_presentation_percentile"
+    ]
+    num_threshold_mhcflurry_presentation_percentile = merged[
+        "num_threshold_mhcflurry_presentation_percentile"
+    ]
+    step_type_mhcflurry_pres_pct = merged["step_type_mhcflurry_pres_pct"]
+    min_threshold_netmhcpan_ba = merged["min_threshold_netmhcpan_ba"]
+    max_threshold_netmhcpan_ba = merged["max_threshold_netmhcpan_ba"]
+    num_threshold_netmhcpan_ba = merged["num_threshold_netmhcpan_ba"]
+    step_type_netmhcpan_ba = merged["step_type_netmhcpan_ba"]
+    min_threshold_netmhcpan_percentile = merged["min_threshold_netmhcpan_percentile"]
+    max_threshold_netmhcpan_percentile = merged["max_threshold_netmhcpan_percentile"]
+    num_threshold_netmhcpan_percentile = merged["num_threshold_netmhcpan_percentile"]
+    step_type_netmhcpan_pct = merged["step_type_netmhcpan_pct"]
+
+    # Column names (original names in input file):
+    col_chromosome = merged["col_chromosome"]
+    col_start = merged["col_start"]
+    col_stop = merged["col_stop"]
+    col_reference = merged["col_reference"]
+    col_variant = merged["col_variant"]
+    col_transcript = merged["col_transcript"]
+    col_transcript_support = merged["col_transcript_support"]
+    col_transcript_expression = merged["col_transcript_expression"]
+    col_biotype = merged["col_biotype"]
+    col_protein_position = merged["col_protein_position"]
+    col_gene_name = merged["col_gene_name"]
+    col_mutation = merged["col_mutation"]
+    col_mhcflurry_presentation = merged["col_mhcflurry_presentation"]
+    col_netmhcpanel_el = merged["col_netmhcpanel_el"]
+    col_mhcflurry_presentation_percentile = merged[
+        "col_mhcflurry_presentation_percentile"
+    ]
+    col_netmhcpan_ba = merged["col_netmhcpan_ba"]
+    col_netmhcpan_percentile = merged["col_netmhcpan_percentile"]
+    col_tumor_dna_vaf = merged["col_tumor_dna_vaf"]
+    col_hla_allele = merged["col_hla_allele"]
+
     # Add log file handler.
     logger.add(
         log_file,
@@ -239,28 +414,32 @@ def main(
         logger.error("Error reading {}: {}", input_file, e)
         sys.exit(1)
 
+    # --- Rename input columns to canonical names ---
+    col_mapping = {
+        col_chromosome: "Chromosome",
+        col_start: "Start",
+        col_stop: "Stop",
+        col_reference: "Reference",
+        col_variant: "Variant",
+        col_transcript: "Transcript",
+        col_transcript_support: "Transcript Support Level",
+        col_transcript_expression: "Transcript Expression",
+        col_biotype: "Biotype",
+        col_protein_position: "Protein Position",
+        col_gene_name: "Gene Name",
+        col_mutation: "Mutation",
+        col_mhcflurry_presentation: "MHCflurryEL Presentation MT Score",
+        col_netmhcpanel_el: "NetMHCpanEL MT Percentile",
+        col_mhcflurry_presentation_percentile: "MHCflurryEL Presentation MT Percentile",
+        col_netmhcpan_ba: "NetMHCpan MT IC50 Score",
+        col_netmhcpan_percentile: "NetMHCpan MT Percentile",
+        col_tumor_dna_vaf: "Tumor DNA VAF",
+        col_hla_allele: "HLA Allele",
+    }
+    df.rename(columns=col_mapping, inplace=True)
+
     # Check required columns.
-    required_columns = [
-        "Chromosome",
-        "Start",
-        "Stop",
-        "Reference",
-        "Variant",
-        "Transcript",
-        "Transcript Support Level",
-        "Transcript Expression",
-        "Biotype",
-        "Protein Position",
-        "Gene Name",
-        "Mutation",
-        "MHCflurryEL Presentation MT Score",
-        "NetMHCpanEL MT Percentile",
-        "MHCflurryEL Presentation MT Percentile",
-        "NetMHCpan MT IC50 Score",
-        "NetMHCpan MT Percentile",
-        "Tumor DNA VAF",
-        "HLA Allele",
-    ]
+    required_columns = list(col_mapping.values())
     missing = [col for col in required_columns if col not in df.columns]
     if missing:
         logger.error("Missing required columns: {}", missing)
@@ -309,7 +488,7 @@ def main(
         )
     else:
         logger.error(
-            "Invalid step type for netmhcpan el percentile: {}",
+            "Invalid step type for netmhcpanel el percentile: {}",
             step_type_netmhcpanel_el,
         )
         sys.exit(1)
